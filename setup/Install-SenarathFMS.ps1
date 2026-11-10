@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  One-shot installer for Senarath Bank FMS on IIS (Windows Server / AD DC).
+  One-shot installer for Senarath Bank FMS on IIS (standalone Windows Server 2025/2022/2019).
 
 .DESCRIPTION
   Installs IIS + CGI, VC++ runtime, PHP (NTS x64), registers PHP FastCGI,
@@ -10,7 +10,8 @@
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\setup\Install-SenarathFMS.ps1
-  powershell -ExecutionPolicy Bypass -File .\setup\Install-SenarathFMS.ps1 -Port 8080 -PhpZip C:\Temp\php-8.3.x-nts-Win32-vs16-x64.zip
+  powershell -ExecutionPolicy Bypass -File .\setup\Install-SenarathFMS.ps1 -Port 8080 -PhpZip C:\Temp\php-8.x-nts-Win32-vs17-x64.zip
+  powershell -ExecutionPolicy Bypass -File .\setup\Install-SenarathFMS.ps1 -AllowFrom 192.168.10.0/24
 #>
 [CmdletBinding()]
 param(
@@ -20,7 +21,8 @@ param(
     [int]   $Port     = 8080,
     [string]$PhpDir   = 'C:\PHP',
     [string]$PhpZip   = '',
-    [string]$LogRoot  = 'C:\SenarathFMS_Logs'
+    [string]$LogRoot  = 'C:\SenarathFMS_Logs',
+    [string]$AllowFrom = 'Any'          # firewall: 'Any', 'LocalSubnet' or a CIDR such as 192.168.10.0/24
 )
 
 $ErrorActionPreference = 'Stop'
@@ -160,9 +162,13 @@ icacls $PhpDir         /grant "IIS_IUSRS:(OI)(CI)RX" /T /C /Q | Out-Null
 Ok "$poolId can read the app and write data + logs"
 
 # --- 9. firewall ------------------------------------------------------------------------
-Step "Opening TCP $Port in Windows Firewall"
-if (-not (Get-NetFirewallRule -DisplayName "SenarathFMS HTTP $Port" -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -DisplayName "SenarathFMS HTTP $Port" -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow -Profile Domain,Private | Out-Null
+Step "Opening TCP $Port in Windows Firewall (all profiles, from $AllowFrom)"
+# a workgroup server usually sits on the Public profile, so the rule must cover all profiles
+$fw = "SenarathFMS HTTP $Port"
+if (Get-NetFirewallRule -DisplayName $fw -ErrorAction SilentlyContinue) {
+    Set-NetFirewallRule -DisplayName $fw -Profile Any -RemoteAddress $AllowFrom -Enabled True
+} else {
+    New-NetFirewallRule -DisplayName $fw -Direction Inbound -Protocol TCP -LocalPort $Port -Action Allow -Profile Any -RemoteAddress $AllowFrom | Out-Null
 }
 Ok 'Firewall rule present'
 
@@ -177,6 +183,7 @@ Ok "HTTP $($r.StatusCode)  X-SB-Event=$($r.Headers['X-SB-Event'])  X-SB-ReqId=$(
 
 Write-Host "`nSenarath Bank FMS is live:" -ForegroundColor Yellow
 Write-Host "  http://localhost:$Port/          (on this server)"
-Write-Host "  http://$($env:COMPUTERNAME):$Port/   (from the lab network)"
+$ips = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' }).IPAddress -join ', '
+Write-Host "  http://<server-ip>:$Port/        (from the lab network; this server: $ips)"
 Write-Host "  App log : $LogRoot\app\sbfms-yyyyMMdd.log"
 Write-Host "  IIS log : $LogRoot\IIS\W3SVC$SiteId\u_exyyMMdd.log  (flush with: netsh http flush logbuffer)"

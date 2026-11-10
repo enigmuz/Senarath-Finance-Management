@@ -1,0 +1,36 @@
+# Falcon LogScale Collector -> CrowdStrike Falcon Next-Gen SIEM
+# SB-FMS sources: IIS W3C log (with x-sb-* fields) and the SB-FMS application log.
+#
+# Normally filled in by setup\Configure-LogCollector.ps1. To edit by hand:
+#   - replace the four <...> placeholders with the API key + URL of each HEC data connector
+#   - remove "/services/collector" from the end of each URL
+#   - keep the dataDirectory line that the collector installer created
+#
+# If the collector is enrolled in Fleet Management, paste the "sources" and "sinks"
+# blocks into the Fleet Management config instead (the local file is not used then).
+
+sources:
+  sbfms_iis:
+    type: file
+    include:
+      - "C:/SenarathFMS_Logs/IIS/W3SVC20/*.log"
+    sink: ngsiem_sbfms_iis
+
+  sbfms_app:
+    type: file
+    include:
+      - "C:/SenarathFMS_Logs/app/*.log"
+    sink: ngsiem_sbfms_app
+
+sinks:
+  ngsiem_sbfms_iis:
+    type: hec
+    proxy: none
+    token: <IIS_CONNECTOR_API_KEY>
+    url: <IIS_CONNECTOR_URL>
+
+  ngsiem_sbfms_app:
+    type: hec
+    proxy: none
+    token: <APP_CONNECTOR_API_KEY>
+    url: <APP_CONNECTOR_URL>

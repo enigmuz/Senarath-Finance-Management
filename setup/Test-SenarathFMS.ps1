@@ -10,7 +10,7 @@
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\setup\Test-SenarathFMS.ps1
-  powershell -ExecutionPolicy Bypass -File .\setup\Test-SenarathFMS.ps1 -Base http://dc01.senarath.local:8080
+  powershell -ExecutionPolicy Bypass -File .\setup\Test-SenarathFMS.ps1 -Base http://192.168.10.50:8080
 #>
 param(
     [string]$Base    = 'http://localhost:8080',

@@ -1,16 +1,18 @@
-# Senarath Bank FMS — Deploy on IIS (AD/DC laptop) and verify logs
+# Senarath Bank FMS — Deploy on Windows Server 2025 (standalone) and ship logs to Falcon NG-SIEM
 
-Everything below is copy-paste. Run all DC commands in **PowerShell as Administrator**.
+Target: a dedicated internal PC running **Windows Server 2025** (workgroup — no AD, not a DC).
+Everything below is copy-paste. Run all server commands in **PowerShell as Administrator**.
 
 | Item | Value |
 |---|---|
-| Repo folder on DC | `C:\SenarathFMS` (IIS serves `C:\SenarathFMS\app`) |
-| URL | `http://localhost:8080` (on DC) · `http://DC01:8080` (lab network) |
+| Repo folder on server | `C:\SenarathFMS` (IIS serves `C:\SenarathFMS\app`) |
+| URL | `http://localhost:8080` (on the server) · `http://<server-ip>:8080` (lab network) |
 | IIS site / app pool / site ID | `SenarathFMS` / `SenarathFMS` / `20` |
 | PHP | `C:\PHP` (NTS x64, FastCGI) |
 | App log | `C:\SenarathFMS_Logs\app\sbfms-yyyyMMdd.log` |
 | IIS W3C log | `C:\SenarathFMS_Logs\IIS\W3SVC20\u_exyyMMdd.log` |
 | Database | `C:\SenarathFMS\app\data\sbfms.sqlite` (auto-created with synthetic data on first request) |
+| Log shipping | Falcon LogScale Collector → 2 HEC data connectors in Next-Gen SIEM |
 
 Lab accounts (synthetic, lab only):
 
@@ -24,6 +26,22 @@ Lab accounts (synthetic, lab only):
 
 ---
 
+## 0. Prepare the server (once)
+
+```powershell
+# optional: give it a clear name first - it appears in every IIS and app log line (reboots)
+Rename-Computer -NewName SBFMS-WEB01 -Restart
+
+# note the server IP (use a static IP or DHCP reservation so the URL doesn't change)
+Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' } | Select-Object InterfaceAlias, IPAddress
+
+# check the clock is synchronised (SIEM correlation depends on it)
+w32tm /query /status
+
+# check port 8080 is free (no output = free)
+Get-NetTCPConnection -State Listen -LocalPort 8080 -ErrorAction SilentlyContinue
+```
+
 ## 1. Push the code to your repo (your workstation)
 
 ```powershell
@@ -35,8 +53,9 @@ git branch -M main
 git remote add origin https://github.com/<your-org>/senarath-fms.git
 git push -u origin main
 ```
+Already pushed earlier? Just: `git add . ; git commit -m "Standalone Server 2025 + collector" ; git push`
 
-## 2. Get the code onto the DC
+## 2. Get the code onto the server
 
 **2.1 Enable TLS 1.2 for this PowerShell window**
 ```powershell
@@ -60,7 +79,7 @@ cd C:\SenarathFMS
 ```
 Private repo: Git asks for credentials — use your GitHub username and a Personal Access Token as the password.
 
-*No internet/Git on the DC?* Download the repo ZIP on another machine, copy it over, then:
+*No Git on the server?* Download the repo ZIP on another machine, copy it over, then:
 ```powershell
 Expand-Archive .\senarath-fms-main.zip -DestinationPath C:\ ; Rename-Item C:\senarath-fms-main C:\SenarathFMS
 ```
@@ -72,30 +91,35 @@ cd C:\SenarathFMS
 Set-ExecutionPolicy -Scope Process Bypass -Force
 .\setup\Install-SenarathFMS.ps1
 ```
+It ends with `[OK] HTTP 200  X-SB-Event=page.view ...` and prints the URLs and the server IPs.
 
-It ends with `[OK] HTTP 200  X-SB-Event=page.view ...` and prints the URLs.
+Options:
+- `-AllowFrom 192.168.10.0/24` — only allow your lab subnet through the firewall (default `Any`; the rule covers all firewall profiles because a workgroup server is usually on the *Public* profile)
+- `-Port 8090` — if 8080 is taken
+- `-PhpZip C:\Temp\php-8.x-nts-Win32-vs17-x64.zip` — offline PHP install (download the **NTS x64** ZIP from windows.php.net on another machine)
 
-Options: `-Port 8080` (default), `-SiteId 20`, `-PhpZip C:\Temp\php-8.x-nts-Win32-vs16-x64.zip` (offline PHP install — download the **NTS x64** ZIP from windows.php.net on another machine).
-
-> What the script does is listed step by step in **Section 8** (manual install) if you prefer to run it command by command.
+Section 8 lists what the script does, command by command, if you prefer to run it manually.
 
 ## 4. Open the app
 
 ```powershell
 Start-Process http://localhost:8080
 ```
-Sign in as `admin / Admin@123`. From another lab machine: `http://<DC hostname or IP>:8080`.
+Sign in as `admin / Admin@123`.
 
-Optional friendly name (the DC is your DNS server):
+From other lab machines browse `http://<server-ip>:8080`. For a friendly name instead, pick one:
 ```powershell
-$ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -notlike '127.*' -and $_.PrefixOrigin -ne 'WellKnown' } | Select-Object -First 1).IPAddress
-Add-DnsServerResourceRecordA -ZoneName senarath.local -Name fms -IPv4Address $ip
-# then browse http://fms.senarath.local:8080
+# a) on each client (PowerShell as Administrator)
+Add-Content C:\Windows\System32\drivers\etc\hosts "`n<server-ip>  fms.senarath.local"
+
+# b) or once, on the lab DNS server (your lab DC)
+Add-DnsServerResourceRecordA -ZoneName senarath.local -Name fms -IPv4Address <server-ip>
 ```
+Then browse `http://fms.senarath.local:8080`.
 
-## 5. Verify logging
+## 5. Verify logging on the server
 
-**5.1 Generate demo traffic (teller day, RBAC denials, brute force + lockout, password spray, PII export, high-value txn, CSRF, path probing)**
+**5.1 Generate demo traffic** (teller day, RBAC denials, brute force + lockout, password spray, PII export, high-value txn, CSRF, path probing — all against the app's own users, nothing touches AD)
 ```powershell
 cd C:\SenarathFMS
 .\setup\Test-SenarathFMS.ps1
@@ -124,7 +148,7 @@ Get-Content $iis -Tail 20
 Select-String -Path $iis -Pattern 'auth.login.failure|auth.account.locked|access.denied' | Select-Object -Last 10
 ```
 
-**5.5 Correlate one request across both logs** (copy any request id shown by the test script or in the page footer)
+**5.5 Correlate one request across both logs** (request id from the test output or the page footer)
 ```powershell
 $id = '<request id>'
 Select-String -Path C:\SenarathFMS_Logs\app\*.log -SimpleMatch "req_id=$id"
@@ -140,7 +164,55 @@ Get-WebConfiguration "system.applicationHost/sites/site[@name='SenarathFMS']/log
 Get-ItemProperty IIS:\Sites\SenarathFMS -Name logFile | Select-Object directory, logFormat, period
 ```
 
-## 6. Log formats
+## 6. Ship the logs to Falcon Next-Gen SIEM (LogScale Collector)
+
+The collector on this server reads both log folders and sends each one to its own HEC data connector, so each source gets its own parser in NG-SIEM.
+
+**6.1 Create two HEC data connectors** (Falcon console)
+1. **Next-Gen SIEM → Data onboarding** → tile **HEC / HTTP Event Collector**.
+2. Create the first one, e.g. name `SBFMS-IIS`, and choose the parser you want for the IIS log. Save, then **generate the API key** and copy the **API key** and **API URL**.
+3. Repeat for `SBFMS-App` (the application log) and copy its API key and URL.
+
+**6.2 Install the collector**
+1. Falcon console → **Support and resources → Tool downloads** → download the latest **LogScale Collector for Windows (x64)** MSI and copy it to `C:\Temp` on the server.
+2. Install it silently:
+```powershell
+$msi = (Get-ChildItem C:\Temp\*ollector*.msi | Sort-Object LastWriteTime)[-1].FullName
+Start-Process msiexec.exe -ArgumentList '/i', "`"$msi`"", '/qn' -Wait
+Get-Service | Where-Object DisplayName -like '*Log Collector*'
+```
+Default install folder: `C:\Program Files (x86)\CrowdStrike\Humio Log Collector\` (the MSI creates the service but leaves it stopped / Manual).
+
+**6.3 Configure and start it** (paste the URLs exactly as shown in the console — the script strips `/services/collector`)
+```powershell
+cd C:\SenarathFMS
+.\setup\Configure-LogCollector.ps1 -IisUrl '<SBFMS-IIS API URL>' -IisKey '<SBFMS-IIS API key>' -AppUrl '<SBFMS-App API URL>' -AppKey '<SBFMS-App API key>'
+```
+It backs up `config.yaml`, writes the two file sources + two HEC sinks, sets the service to Automatic and restarts it. A hand-editable template of the same config is in `setup\logscale-collector.yaml`.
+
+*Using Fleet Management instead of a local config?* Enroll the collector with the command the console gives you, and paste the `sources:` and `sinks:` blocks from `setup\logscale-collector.yaml` (with your keys/URLs) into the Fleet Management config.
+
+**6.4 Verify**
+```powershell
+# service running
+Get-Service | Where-Object DisplayName -like '*Log Collector*' | Select-Object Name, Status, StartType
+
+# generate fresh events
+.\setup\Test-SenarathFMS.ps1
+netsh http flush logbuffer
+
+# if nothing arrives: run the collector in the foreground and read the errors (Ctrl+C, then start the service again)
+$svc = (Get-Service | Where-Object DisplayName -like '*Log Collector*').Name
+$dir = 'C:\Program Files (x86)\CrowdStrike\Humio Log Collector'
+Stop-Service $svc
+& (Get-ChildItem $dir -Filter '*collector.exe')[0].FullName --cfg "$dir\config.yaml" --log-level debug --log-pretty
+Start-Service $svc
+```
+In the Falcon console, the two connectors show data arriving; in **Next-Gen SIEM → Advanced event search**, search for a request id printed by the test script (last 15 minutes) — it should match one IIS event and one app event.
+
+Notes for the parsers: IIS log files start with `#Software/#Version/#Date/#Fields` header lines (drop lines starting with `#`); IIS times are UTC, the app log carries its own `+05:30` offset.
+
+## 7. Log formats
 
 **IIS W3C** (times are UTC; custom fields appended after the standard ones; IIS writes spaces as `+`). Expected header — confirm yours with step 5.4:
 ```
@@ -150,7 +222,7 @@ Get-ItemProperty IIS:\Sites\SenarathFMS -Name logFile | Select-Object directory,
 
 **Application log** (local time; syslog-style header + key=value body):
 ```
-2026-11-10T15:41:11.347+05:30 DC01 SBFMS[4312]: severity=WARN event=user.role.change result=success user=admin role=admin src_ip=10.10.10.25 req_id=ac8be077d261 session=2bbbbf2beeab method=POST uri=/users.php target_user=teller1 old_role=teller new_role=manager escalation=true ua="Mozilla/5.0 ..."
+2026-11-10T15:41:11.347+05:30 SBFMS-WEB01 SBFMS[4312]: severity=WARN event=user.role.change result=success user=admin role=admin src_ip=10.10.10.25 req_id=ac8be077d261 session=2bbbbf2beeab method=POST uri=/users.php target_user=teller1 old_role=teller new_role=manager escalation=true ua="Mozilla/5.0 ..."
 ```
 
 **Event catalogue**
@@ -175,15 +247,6 @@ Get-ItemProperty IIS:\Sites\SenarathFMS -Name logFile | Select-Object directory,
 | user.create / user.role.change / user.disable / user.enable / user.unlock / user.password.reset | WARN (HIGH for admin role) | `escalation=true` on privilege increase |
 | app.error | HIGH | unhandled exception (HTTP 500) |
 
-## 7. Ship to CrowdStrike Falcon NG-SIEM
-
-Add two file sources to your existing Falcon LogScale Collector config on the DC:
-
-- `C:\SenarathFMS_Logs\IIS\W3SVC20\*.log` — IIS W3C with custom fields
-- `C:\SenarathFMS_Logs\app\*.log` — SB-FMS application events
-
-Restart the collector service after editing its config.
-
 ## 8. Manual install (what the script does, command by command)
 
 ```powershell
@@ -196,7 +259,7 @@ Invoke-WebRequest https://aka.ms/vs/17/release/vc_redist.x64.exe -OutFile "$env:
 Start-Process "$env:TEMP\vc_redist.x64.exe" -ArgumentList '/install','/quiet','/norestart' -Wait
 
 # 8.3 PHP NTS x64 -> C:\PHP  (download the "VS16/VS17 x64 Non Thread Safe" ZIP from https://windows.php.net/download/)
-Expand-Archive C:\Temp\php-8.x-nts-Win32-vs16-x64.zip -DestinationPath C:\PHP -Force
+Expand-Archive C:\Temp\php-8.x-nts-Win32-vs17-x64.zip -DestinationPath C:\PHP -Force
 Copy-Item C:\PHP\php.ini-production C:\PHP\php.ini
 New-Item -ItemType Directory -Force C:\SenarathFMS_Logs\php | Out-Null
 Add-Content C:\PHP\php.ini "`nextension_dir = `"C:\PHP\ext`"`nextension = pdo_sqlite`nextension = sqlite3`ncgi.force_redirect = 0`ncgi.fix_pathinfo = 1`nfastcgi.impersonate = 1`ndate.timezone = Asia/Colombo`nexpose_php = Off`nlog_errors = On`nerror_log = `"C:\SenarathFMS_Logs\php\php_errors.log`""
@@ -232,7 +295,7 @@ icacls C:\SenarathFMS_Logs\php   /grant "IIS AppPool\SenarathFMS:(OI)(CI)M"  /T
 icacls C:\PHP                    /grant "IIS_IUSRS:(OI)(CI)RX" /T
 
 # 8.9 Firewall + start
-New-NetFirewallRule -DisplayName "SenarathFMS HTTP 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Domain,Private
+New-NetFirewallRule -DisplayName "SenarathFMS HTTP 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Any -RemoteAddress Any
 Start-Website SenarathFMS
 (Invoke-WebRequest http://localhost:8080/login.php -UseBasicParsing).Headers['X-SB-Event']     # -> page.view
 ```
@@ -246,12 +309,11 @@ cd C:\SenarathFMS; git pull; Restart-WebAppPool SenarathFMS
 # reset the database to fresh synthetic data (recreated on next request)
 Stop-WebAppPool SenarathFMS; Remove-Item C:\SenarathFMS\app\data\sbfms.sqlite*; Start-WebAppPool SenarathFMS
 
-# unlock an account without the UI (e.g. admin)
+# unlock an account without the UI (e.g. admin), optionally with a new password
 C:\PHP\php.exe C:\SenarathFMS\setup\unlock-user.php admin
-# ...or unlock + set a new password
 C:\PHP\php.exe C:\SenarathFMS\setup\unlock-user.php admin "NewPass@123"
 
-# remove the site (keeps PHP and logs)
+# remove the site (keeps PHP, logs and the collector)
 Remove-Website SenarathFMS; Remove-WebAppPool SenarathFMS; Remove-NetFirewallRule -DisplayName "SenarathFMS HTTP 8080"
 ```
 
@@ -259,12 +321,15 @@ Remove-Website SenarathFMS; Remove-WebAppPool SenarathFMS; Remove-NetFirewallRul
 
 | Symptom | Fix |
 |---|---|
+| Other machines can't open the site | firewall rule must cover the *Public* profile → `Get-NetFirewallRule -DisplayName "SenarathFMS HTTP 8080" \| Select Profile, Enabled`; re-run the installer; test with `Test-NetConnection <server-ip> -Port 8080` from a client |
 | HTTP 500.0 / `0x8007007e` or `php-cgi.exe` exits | VC++ runtime missing → step 8.2 |
 | HTTP 404.3 or PHP file downloads | handler not registered → step 8.4, then `iisreset` |
 | Page says “could not find driver” | `pdo_sqlite` not enabled → check `C:\PHP\php.ini`, `C:\PHP\php.exe -m` |
 | “unable to open database file” / error page | app pool can't write `app\data` → re-run 8.8 |
 | App log empty | app pool can't write `C:\SenarathFMS_Logs\app` → re-run 8.8 |
-| IIS log has no `x-sb-*` columns | custom fields need IIS 8.5+ (Server 2012 R2 or newer) → re-run 8.7; new columns appear in a new log file / after `iisreset` |
+| IIS log has no `x-sb-*` columns | re-run 8.7; the new columns start in a new log file / after `iisreset` |
 | IIS log not updated yet | `netsh http flush logbuffer` |
-| Port 8080 in use | re-run installer with `-Port 8090` (and update firewall rule) |
+| Collector service stops right after start | config error → run it in the foreground (6.4) and read the message; check the URL has no `/services/collector` |
+| Collector runs but NG-SIEM shows nothing | wrong API key/URL pairing, or outbound HTTPS blocked → `Test-NetConnection <ingest host> -Port 443` |
+| Port 8080 in use | re-run installer with `-Port 8090` |
 | Server errors in detail | `Get-Content C:\SenarathFMS_Logs\php\php_errors.log -Tail 20` |
