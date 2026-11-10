@@ -1,0 +1,5 @@
+# runtime data (SQLite DB, sessions, local logs) - created on the server
+app/data/*
+!app/data/.gitkeep
+app/includes/config.local.php
+*.log
